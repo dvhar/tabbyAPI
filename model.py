@@ -588,12 +588,11 @@ class ModelContainer:
         else:
             # Dynamically scale penalty range to output tokens
             # Only do this if freq/pres pen is enabled and the repetition range is -1
+            gen_settings.token_frequency_penalty = frequency_penalty
             auto_scale_penalty_range = (
                 gen_settings.token_frequency_penalty != 0
                 or gen_settings.token_presence_penalty != 0
             ) and gen_settings.token_repetition_range == -1
-
-            gen_settings.token_frequency_penalty = frequency_penalty
 
         # Always make sure the fallback is 0 if range < 0
         # It's technically fine to use -1, but this just validates the passed
