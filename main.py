@@ -5,7 +5,7 @@ from asyncio import CancelledError
 from typing import Optional
 from uuid import uuid4
 from jinja2 import TemplateError
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from functools import partial
@@ -49,6 +49,7 @@ from OAI.utils_oai import (
 from templating import get_all_templates, get_prompt_from_template
 from utils import get_generator_error, get_sse_packet, load_progress, unwrap
 from logger import init_logger
+import vector_db
 
 logger = init_logger(__name__)
 
@@ -492,6 +493,13 @@ async def generate_chat_completion(request: Request, data: ChatCompletionRequest
 
     return response
 
+@app.post("/v1/chroma/index")
+async def index(file: UploadFile):
+    return vector_db.index(file)
+
+@app.get("/v1/chroma/search")
+async def search(query: str):
+    return vector_db.search(query)
 
 def entrypoint():
     """Entry function for program startup"""
