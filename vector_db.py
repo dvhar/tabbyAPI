@@ -1,7 +1,9 @@
 import chromadb
 from chromadb.config import Settings
-import itertools
+import itertools, re
 from fastapi import FastAPI, UploadFile
+import PyPDF2
+from epub2txt import epub2txt
 
 chroma_client = chromadb.PersistentClient(
         settings=Settings(anonymized_telemetry=False),
@@ -23,18 +25,62 @@ def group_consecutive(ids: list, docs: list):
     result.append('.'.join(sublist_texts))
     return result
 
+def clean_name(name: str):
+    pat = re.compile('[^a-zA-Z0-9_-]')
+    name = re.sub(pat, '', name)
+    if not name:
+        raise Exception('bad name')
+    if len(name) < 3:
+        name += 'aaa'
+    if re.match(r'^\d', name):
+        name = 'a'+name
+    if len(name) > 62:
+        name = name[:62]
+    if re.match(r'\d', name[-1]):
+        name = name+'a'
+    return name
+
+def file_to_text(file: UploadFile):
+    if '.pdf' in file.filename:
+        txt = ''
+        pdf = PyPDF2.PdfReader(file.file)
+        for page in pdf.pages:
+            txt += page.extract_text()
+        if len(txt) < 10:
+            raise Exception('pdf not convertable to text, requires ocr')
+        return txt
+    if '.epub' in file.filename:
+        with open('/tmp/chroma_data/.tempepub','wb') as f:
+            f.write(file.file.read())
+        return epub2txt('/tmp/chroma_data/.tempepub')
+    else:
+        return file.file.read().decode('utf-8')
+
+def listdocs():
+    """List indexed documents"""
+    global chroma_collection
+    lst = chroma_client.list_collections()
+    return [doc.name for doc in lst]
+
 def index(file: UploadFile):
     """Index a text file with chromadb"""
     global chroma_collection
+    cname = clean_name(file.filename)
     try:
-        chroma_collection = chroma_client.create_collection(file.filename)
-    except:
-        chroma_collection = chroma_client.get_collection(file.filename)
+        chroma_collection = chroma_client.create_collection(cname)
+    except Exception as e:
+        print(e)
+        chroma_collection = chroma_client.get_collection(cname)
         return {'message': 'Already indexed'}
-    data = [sentence for sentence in file.file.read().decode('utf-8').split('.')]
-    ids=[str(i) for i, _ in enumerate(data)]
-    chroma_collection.upsert(documents=data, ids=ids)
-    return {'message': 'Document indexed'}
+    try:
+        txt = file_to_text(file)
+        data = [sentence for sentence in txt.split('.')]
+        ids=[str(i) for i, _ in enumerate(data)]
+        chroma_collection.upsert(documents=data, ids=ids)
+        return {'message': 'Document indexed'}
+    except Exception as e:
+        chroma_client.delete_collection(cname)
+        return {'message': 'Error indexing', 'error':str(e)}
 
 def search(query: str):
     """Return relavant texts from chromadb"""
@@ -42,7 +88,7 @@ def search(query: str):
     results = chroma_collection.query(query_texts=query_texts, n_results=100, include=[])
     morenums = []
     for ids in results.get('ids'):
-        tuples = [(n-3,n-2,n-1,n,n+1,n+2,n+3) for n in (int(id) for id in ids)]
+        tuples = [(n-1,n,n+1,n+2,n+3) for n in (int(id) for id in ids)]
         morenums += [i for i in itertools.chain(*tuples) if i >= 0]
     morenums = list(set(morenums))
     morenums.sort()
@@ -65,6 +111,11 @@ if __name__ == '__main__':
     @app.get("/v1/chroma/search")
     async def search_(query: str):
         return search(query)
+
+    @app.get("/v1/chroma/list")
+    async def listdocs_():
+        return listdocs()
+
 
     uvicorn.run(
         app,
