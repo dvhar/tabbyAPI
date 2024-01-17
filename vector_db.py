@@ -4,6 +4,9 @@ import itertools, re
 from fastapi import FastAPI, UploadFile
 import PyPDF2
 from epub2txt import epub2txt
+from PIL import Image
+from pdf2image import convert_from_bytes
+import pytesseract
 
 chroma_client = chromadb.PersistentClient(
         settings=Settings(anonymized_telemetry=False),
@@ -40,15 +43,31 @@ def clean_name(name: str):
         name = name+'a'
     return name
 
-def file_to_text(file: UploadFile):
+def ocr(file):
+    txt = ''
+    file.seek(0)
+    b = file.read()
+    pages = convert_from_bytes(b)
+    for page in pages:
+        txt += str(pytesseract.image_to_string(page).encode("utf-8"))
+    print('pdf len from OCR:',len(txt))
+    return txt
+
+def file_to_text(file: UploadFile) -> str:
     if '.pdf' in file.filename:
         txt = ''
-        pdf = PyPDF2.PdfReader(file.file)
-        for page in pdf.pages:
-            txt += page.extract_text()
-        if len(txt) < 10:
-            raise Exception('pdf not convertable to text, requires ocr')
-        return txt
+        try:
+            pdf = PyPDF2.PdfReader(file.file)
+            for page in pdf.pages:
+                txt += page.extract_text()
+            if len(txt) < 1000:
+                txt = None
+        except Exception as e:
+            print('Exception in PyPDF2, trying ocr next:',e)
+            return ocr(file.file)
+        if not txt:
+            print('Not enough text found, using OCR')
+            return ocr(file.file)
     if '.epub' in file.filename:
         with open('/tmp/chroma_data/.tempepub','wb') as f:
             f.write(file.file.read())
@@ -58,9 +77,19 @@ def file_to_text(file: UploadFile):
 
 def listdocs():
     """List indexed documents"""
-    global chroma_collection
     lst = chroma_client.list_collections()
     return [doc.name for doc in lst]
+
+def changedoc(name: str):
+    """List indexed documents"""
+    global chroma_collection
+    try:
+        cname = clean_name(name)
+        chroma_collection = chroma_client.get_collection(cname)
+        return {'message': f'Using index {cname}'}
+    except Exception as e:
+        print(e)
+        return {'error': str(e)}
 
 def index(file: UploadFile):
     """Index a text file with chromadb"""
@@ -74,13 +103,13 @@ def index(file: UploadFile):
         return {'message': 'Already indexed'}
     try:
         txt = file_to_text(file)
-        data = [sentence for sentence in txt.split('.')]
+        data = [sentence for sentence in txt.split('.') if len(sentence) > 8]
         ids=[str(i) for i, _ in enumerate(data)]
         chroma_collection.upsert(documents=data, ids=ids)
         return {'message': 'Document indexed'}
     except Exception as e:
         chroma_client.delete_collection(cname)
-        return {'message': 'Error indexing', 'error':str(e)}
+        return {'error':str(e)}
 
 def search(query: str):
     """Return relavant texts from chromadb"""
@@ -115,6 +144,10 @@ if __name__ == '__main__':
     @app.get("/v1/chroma/list")
     async def listdocs_():
         return listdocs()
+
+    @app.get("/v1/chroma/change")
+    async def changedoc_(name: str):
+        return changedoc(name)
 
 
     uvicorn.run(

@@ -501,6 +501,14 @@ async def index(file: UploadFile):
 async def search(query: str):
     return vector_db.search(query)
 
+@app.get("/v1/chroma/list")
+async def listdocs():
+    return vector_db.listdocs()
+
+@app.get("/v1/chroma/change")
+async def changedoc(name: str):
+    return vector_db.changedoc(name)
+
 def entrypoint():
     """Entry function for program startup"""
     global MODEL_CONTAINER
