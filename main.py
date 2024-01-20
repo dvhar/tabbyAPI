@@ -509,6 +509,10 @@ async def listdocs():
 async def changedoc(name: str):
     return vector_db.changedoc(name)
 
+@app.get("/v1/chroma/delete")
+async def deletedoc(name: str):
+    return vector_db.deletedoc(name)
+
 def entrypoint():
     """Entry function for program startup"""
     global MODEL_CONTAINER

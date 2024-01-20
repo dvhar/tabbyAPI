@@ -57,23 +57,37 @@ def file_to_text(file: UploadFile) -> str:
     if '.pdf' in file.filename:
         txt = ''
         try:
+            print('Trying text extraction wth PyPDF2')
             pdf = PyPDF2.PdfReader(file.file)
             for page in pdf.pages:
                 txt += page.extract_text()
             if len(txt) < 1000:
-                txt = None
+                print(f'Not enough text found: {len(txt)} bytes. Trying OCR next')
+                return ocr(file.file)
+            return txt
         except Exception as e:
             print('Exception in PyPDF2, trying ocr next:',e)
             return ocr(file.file)
-        if not txt:
-            print('Not enough text found, using OCR')
-            return ocr(file.file)
     if '.epub' in file.filename:
+        print('Trying text extraction wth epub2txt')
         with open('/tmp/chroma_data/.tempepub','wb') as f:
             f.write(file.file.read())
         return epub2txt('/tmp/chroma_data/.tempepub')
     else:
+        print('Trying to read text file')
         return file.file.read().decode('utf-8')
+
+def deletedoc(name: str):
+    """Delete indexed document"""
+    global chroma_collection
+    try:
+        cname = clean_name(name)
+        chroma_client.delete_collection(cname)
+        chroma_collection = chroma_client.get_or_create_collection("alldocs")
+        return {'message': f'Deleted index {cname}'}
+    except Exception as e:
+        print(e)
+        return {'error': str(e)}
 
 def listdocs():
     """List indexed documents"""
@@ -81,7 +95,7 @@ def listdocs():
     return [doc.name for doc in lst]
 
 def changedoc(name: str):
-    """List indexed documents"""
+    """Select document for subsequent searches"""
     global chroma_collection
     try:
         cname = clean_name(name)
@@ -148,6 +162,10 @@ if __name__ == '__main__':
     @app.get("/v1/chroma/change")
     async def changedoc_(name: str):
         return changedoc(name)
+
+    @app.get("/v1/chroma/delete")
+    async def delete_(name: str):
+        return deletedoc(name)
 
 
     uvicorn.run(
