@@ -497,9 +497,9 @@ async def generate_chat_completion(request: Request, data: ChatCompletionRequest
 async def index(file: UploadFile):
     return vector_db.index(file)
 
-@app.get("/v1/chroma/search")
-async def search(query: str):
-    return vector_db.search(query)
+@app.post("/v1/chroma/search")
+async def search(data: vector_db.RagSearch):
+    return vector_db.search(data.query)
 
 @app.get("/v1/chroma/list")
 async def listdocs():
