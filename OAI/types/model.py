@@ -1,10 +1,9 @@
 """ Contains model card types. """
+from pydantic import BaseModel, Field, ConfigDict
 from time import time
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
-
-from gen_logging import LogPreferences
+from common.gen_logging import LogPreferences
 
 
 class ModelCardParameters(BaseModel):
@@ -18,6 +17,7 @@ class ModelCardParameters(BaseModel):
     cache_mode: Optional[str] = "FP16"
     prompt_template: Optional[str] = None
     num_experts_per_token: Optional[int] = None
+    use_cfg: Optional[bool] = None
     draft: Optional["ModelCard"] = None
 
 
@@ -45,7 +45,9 @@ class DraftModelLoadRequest(BaseModel):
     draft_model_name: str
     draft_rope_scale: Optional[float] = 1.0
     draft_rope_alpha: Optional[float] = Field(
-        description="Automatically calculated if not present", default=None
+        description="Automatically calculated if not present",
+        default=None,
+        examples=[1.0],
     )
 
 
@@ -59,15 +61,19 @@ class ModelLoadRequest(BaseModel):
     max_seq_len: Optional[int] = Field(
         description="Leave this blank to use the model's base sequence length",
         default=None,
+        examples=[4096],
     )
     override_base_seq_len: Optional[int] = Field(
         description=(
             "Overrides the model's base sequence length. " "Leave blank if unsure"
         ),
         default=None,
+        examples=[4096],
     )
     gpu_split_auto: Optional[bool] = True
-    gpu_split: Optional[List[float]] = Field(default_factory=list)
+    gpu_split: Optional[List[float]] = Field(
+        default_factory=list, examples=[[24.0, 20.0]]
+    )
     rope_scale: Optional[float] = Field(
         description="Automatically pulled from the model's config if not present",
         default=None,
@@ -83,6 +89,8 @@ class ModelLoadRequest(BaseModel):
     cache_mode: Optional[str] = "FP16"
     prompt_template: Optional[str] = None
     num_experts_per_token: Optional[int] = None
+    use_cfg: Optional[bool] = None
+    fasttensors: Optional[bool] = False
     draft: Optional[DraftModelLoadRequest] = None
 
 

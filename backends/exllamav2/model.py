@@ -13,17 +13,17 @@ from exllamav2 import (
     ExLlamaV2Lora,
 )
 from exllamav2.generator import ExLlamaV2StreamingGenerator, ExLlamaV2Sampler
-
-from gen_logging import log_generation_params, log_prompt, log_response
 from typing import List, Optional, Union
-from templating import (
+
+from common.gen_logging import log_generation_params, log_prompt, log_response
+from common.templating import (
     PromptTemplate,
     find_template_from_model,
     get_template_from_model_json,
     get_template_from_file,
 )
-from utils import coalesce, unwrap
-from logger import init_logger
+from common.utils import coalesce, unwrap
+from common.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 AUTO_SPLIT_RESERVE_BYTES = 96 * 1024**2
 
 
-class ModelContainer:
+class ExllamaV2Container:
     """The model container class for ExLlamaV2 models."""
 
     config: Optional[ExLlamaV2Config] = None
@@ -47,6 +47,7 @@ class ModelContainer:
     cache_fp8: bool = False
     gpu_split_auto: bool = True
     gpu_split: Optional[list] = None
+    use_cfg: bool = False
 
     active_loras: List[ExLlamaV2Lora] = []
 
@@ -95,6 +96,8 @@ class ModelContainer:
                     tensors, per device
                 'no_flash_attn' (bool): Turns off flash attention
                     (increases vram usage) (default: False)
+                'use_cfg" (bool): Enables CFG support. Disables flash attention
+                    (default: False)
         """
 
         self.quiet = quiet
@@ -135,8 +138,17 @@ class ModelContainer:
             kwargs.get("rope_alpha"), self.calculate_rope_alpha(base_seq_len)
         )
 
-        # Turn off flash attention?
-        self.config.no_flash_attn = unwrap(kwargs.get("no_flash_attention"), False)
+        # Enable CFG if present
+        self.use_cfg = unwrap(kwargs.get("use_cfg"), False)
+
+        # Enable fasttensors loading if present
+        self.config.fasttensors = unwrap(kwargs.get("fasttensors"), False)
+
+        # Turn off flash attention if CFG is on
+        # Workaround until batched FA2 is fixed in exllamav2 upstream
+        self.config.no_flash_attn = (
+            True if self.use_cfg else unwrap(kwargs.get("no_flash_attention"), False)
+        )
 
         # low_mem is currently broken in exllamav2. Don't use it until it's
         # fixed.
@@ -145,35 +157,10 @@ class ModelContainer:
             self.config.set_low_mem()
         """
 
-        # Set prompt template override if provided
-        prompt_template_name = kwargs.get("prompt_template")
-        if prompt_template_name:
-            logger.info("Loading prompt template with name " f"{prompt_template_name}")
-            # Read the template
-            self.prompt_template = get_template_from_file(prompt_template_name)
-        else:
-            # Then try finding the template from the tokenizer_config.json
-            self.prompt_template = get_template_from_model_json(
-                pathlib.Path(self.config.model_dir) / "tokenizer_config.json",
-                "chat_template",
-                "from_tokenizer_config",
-            )
-
-            # Try finding the chat template from the model's config.json
-            # TODO: This may not even be used with huggingface models,
-            # mark for removal.
-            if self.prompt_template is None:
-                self.prompt_template = get_template_from_model_json(
-                    pathlib.Path(self.config.model_config),
-                    "chat_template",
-                    "from_model_config",
-                )
-
-            # If that fails, attempt fetching from model name
-            if self.prompt_template is None:
-                template_match = find_template_from_model(model_directory)
-                if template_match:
-                    self.prompt_template = get_template_from_file(template_match)
+        # Try to set prompt template
+        self.prompt_template = self.find_prompt_template(
+            kwargs.get("prompt_template"), model_directory
+        )
 
         # Catch all for template lookup errors
         if self.prompt_template:
@@ -189,13 +176,7 @@ class ModelContainer:
         # Set num of experts per token if provided
         num_experts_override = kwargs.get("num_experts_per_token")
         if num_experts_override:
-            if hasattr(self.config, "num_experts_per_token"):
-                self.config.num_experts_per_token = num_experts_override
-            else:
-                logger.warning(
-                    "MoE experts per token override is not "
-                    "supported by the current ExLlamaV2 version."
-                )
+            self.config.num_experts_per_token = kwargs.get("num_experts_per_token")
 
         chunk_size = min(
             unwrap(kwargs.get("chunk_size"), 2048), self.config.max_seq_len
@@ -240,6 +221,34 @@ class ModelContainer:
                 self.draft_config.max_input_len = kwargs["chunk_size"]
                 self.draft_config.max_attn_size = kwargs["chunk_size"] ** 2
 
+    def find_prompt_template(self, prompt_template_name, model_directory):
+        """Tries to find a prompt template using various methods"""
+
+        logger.info("Attempting to load a prompt template if present.")
+
+        find_template_functions = [
+            lambda: get_template_from_model_json(
+                pathlib.Path(self.config.model_dir) / "tokenizer_config.json",
+                "chat_template",
+                "from_tokenizer_config",
+            ),
+            lambda: get_template_from_file(find_template_from_model(model_directory)),
+        ]
+
+        # Add lookup from prompt template name if provided
+        if prompt_template_name:
+            find_template_functions.insert(
+                0, lambda: get_template_from_file(prompt_template_name)
+            )
+
+        for func in find_template_functions:
+            try:
+                prompt_template = func()
+                if prompt_template is not None:
+                    return prompt_template
+            except (FileNotFoundError, LookupError):
+                continue
+
     def calculate_rope_alpha(self, base_seq_len):
         """Calculate the rope alpha value for a given sequence length."""
         ratio = self.config.max_seq_len / base_seq_len
@@ -254,6 +263,7 @@ class ModelContainer:
 
     def get_model_path(self, is_draft: bool = False):
         """Get the path for this model."""
+
         model_path = pathlib.Path(
             self.draft_config.model_dir if is_draft else self.config.model_dir
         )
@@ -268,6 +278,7 @@ class ModelContainer:
                 module loaded. Prototype:
                 def progress(loaded_modules: int, total_modules: int)
         """
+
         for _ in self.load_gen(progress_callback):
             pass
 
@@ -348,10 +359,15 @@ class ModelContainer:
                 if isinstance(value, str):
                     yield value
 
+        batch_size = 2 if self.use_cfg else 1
         if self.cache_fp8:
-            self.cache = ExLlamaV2Cache_8bit(self.model, lazy=self.gpu_split_auto)
+            self.cache = ExLlamaV2Cache_8bit(
+                self.model, lazy=self.gpu_split_auto, batch_size=batch_size
+            )
         else:
-            self.cache = ExLlamaV2Cache(self.model, lazy=self.gpu_split_auto)
+            self.cache = ExLlamaV2Cache(
+                self.model, lazy=self.gpu_split_auto, batch_size=batch_size
+            )
 
         if self.gpu_split_auto:
             reserve = [AUTO_SPLIT_RESERVE_BYTES] + [0] * 16
@@ -374,6 +390,10 @@ class ModelContainer:
             self.draft_model,
             self.draft_cache,
         )
+
+        # Always return logprobs and logits
+        self.generator.return_probabilities = True
+        self.generator.return_logits = True
 
         logger.info("Model successfully loaded.")
 
@@ -433,54 +453,9 @@ class ModelContainer:
         }
 
     def check_unsupported_settings(self, **kwargs):
-        # Warn of unsupported settings if the setting is enabled
-        if (unwrap(kwargs.get("mirostat"), False)) and not hasattr(
-            ExLlamaV2Sampler.Settings, "mirostat"
-        ):
-            logger.warning(
-                "Mirostat sampling is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
+        """Check and warn the user if a sampler is unsupported. Meant for dev wheels!"""
 
-        if (unwrap(kwargs.get("min_p"), 0.0)) not in [0.0, 1.0] and not hasattr(
-            ExLlamaV2Sampler.Settings, "min_p"
-        ):
-            logger.warning(
-                "Min-P sampling is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
-
-        if (unwrap(kwargs.get("tfs"), 0.0)) not in [0.0, 1.0] and not hasattr(
-            ExLlamaV2Sampler.Settings, "tfs"
-        ):
-            logger.warning(
-                "Tail-free sampling (TFS) is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
-
-        if (unwrap(kwargs.get("temperature_last"), False)) and not hasattr(
-            ExLlamaV2Sampler.Settings, "temperature_last"
-        ):
-            logger.warning(
-                "Temperature last is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
-
-        if (unwrap(kwargs.get("top_a"), False)) and not hasattr(
-            ExLlamaV2Sampler.Settings, "top_a"
-        ):
-            logger.warning(
-                "Top-A is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
-
-        if (unwrap(kwargs.get("presence_penalty"), 0.0)) != 0.0 and not hasattr(
-            ExLlamaV2Sampler.Settings, "token_presence_penalty"
-        ):
-            logger.warning(
-                "Presence penalty is not supported by the currently "
-                "installed ExLlamaV2 version."
-            )
+        pass
 
     def generate(self, prompt: str, **kwargs):
         """Generate a response to a prompt"""
@@ -539,16 +514,20 @@ class ModelContainer:
         token_healing = unwrap(kwargs.get("token_healing"), False)
         max_tokens = unwrap(kwargs.get("max_tokens"), 150)
         stream_interval = unwrap(kwargs.get("stream_interval"), 0)
-        generate_window = min(unwrap(kwargs.get("generate_window"), 512), max_tokens)
+        generate_window = max(
+            unwrap(kwargs.get("generate_window"), 512), max_tokens // 8
+        )
 
         # Sampler settings
         gen_settings = ExLlamaV2Sampler.Settings()
 
+        # Check unsupported settings for dev wheels
         self.check_unsupported_settings(**kwargs)
 
         # Apply settings
         gen_settings.temperature = unwrap(kwargs.get("temperature"), 1.0)
         gen_settings.temperature_last = unwrap(kwargs.get("temperature_last"), False)
+        gen_settings.smoothing_factor = unwrap(kwargs.get("smoothing_factor"), 0.0)
         gen_settings.top_k = unwrap(kwargs.get("top_k"), 0)
         gen_settings.top_p = unwrap(kwargs.get("top_p"), 1.0)
         gen_settings.top_a = unwrap(kwargs.get("top_a"), 0.0)
@@ -557,42 +536,72 @@ class ModelContainer:
         gen_settings.typical = unwrap(kwargs.get("typical"), 1.0)
         gen_settings.mirostat = unwrap(kwargs.get("mirostat"), False)
 
+        # DynaTemp settings
+        max_temp = unwrap(kwargs.get("max_temp"), 0.0)
+        min_temp = unwrap(kwargs.get("min_temp"), 0.0)
+
+        if max_temp > min_temp:
+            gen_settings.max_temp = max_temp
+            gen_settings.min_temp = min_temp
+            gen_settings.temp_exponent = unwrap(kwargs.get("temp_exponent"), 1.0)
+        else:
+            # Force to default values
+            gen_settings.max_temp = 0.0
+            gen_settings.min_temp = 0.0
+            gen_settings.temp_exponent = 1.0
+
+        # Warn if max/min temp values are > 0
+        # and if they're less than or equal to each other
+        if max_temp < min_temp or (
+            0 not in {min_temp, max_temp} and max_temp == min_temp
+        ):
+            logger.warning(
+                "Max temp is less than or equal to min temp, skipping DynaTemp."
+            )
+
         # Default tau and eta fallbacks don't matter if mirostat is off
         gen_settings.mirostat_tau = unwrap(kwargs.get("mirostat_tau"), 1.5)
         gen_settings.mirostat_eta = unwrap(kwargs.get("mirostat_eta"), 0.1)
 
-        gen_settings.token_presence_penalty = unwrap(
-            kwargs.get("presence_penalty"), 0.0
-        )
+        # Set CFG scale and negative prompt
+        cfg_scale = unwrap(kwargs.get("cfg_scale"), 1.0)
+        negative_prompt = None
+        if cfg_scale not in [None, 1.0]:
+            if self.use_cfg:
+                gen_settings.cfg_scale = cfg_scale
+
+                # If the negative prompt is empty, use the BOS token
+                negative_prompt = unwrap(
+                    kwargs.get("negative_prompt"), self.tokenizer.bos_token
+                )
+            else:
+                logger.warn(
+                    "CFG is currently disabled. "
+                    "Please reload your model with use_cfg = True.",
+                )
+
         gen_settings.token_repetition_penalty = unwrap(
             kwargs.get("repetition_penalty"), 1.0
+        )
+        gen_settings.token_frequency_penalty = unwrap(
+            kwargs.get("frequency_penalty"), 0.0
+        )
+        gen_settings.token_presence_penalty = unwrap(
+            kwargs.get("presence_penalty"), 0.0
         )
 
         # Applies for all penalties despite being called token_repetition_range
         gen_settings.token_repetition_range = unwrap(
             kwargs.get("penalty_range"), self.config.max_seq_len
         )
-        auto_scale_penalty_range = False
 
-        # Frequency penalty = repetition penalty if the user is on an older exl2 version
-        frequency_penalty = unwrap(kwargs.get("frequency_penalty"), 0.0)
-        if (frequency_penalty) != 0.0 and not hasattr(
-            gen_settings, "token_frequency_penalty"
-        ):
-            logger.warning(
-                "Frequency penalty is not supported by the currently "
-                "installed ExLlamaV2 version. Setting this value to repetition penalty "
-                "instead."
-            )
-            gen_settings.token_repetition_penalty = frequency_penalty
-        else:
-            # Dynamically scale penalty range to output tokens
-            # Only do this if freq/pres pen is enabled and the repetition range is -1
-            gen_settings.token_frequency_penalty = frequency_penalty
-            auto_scale_penalty_range = (
-                gen_settings.token_frequency_penalty != 0
-                or gen_settings.token_presence_penalty != 0
-            ) and gen_settings.token_repetition_range == -1
+        # Dynamically scale penalty range to output tokens
+        # Only do this if freq/pres pen is enabled
+        # and the repetition range is -1
+        auto_scale_penalty_range = (
+            gen_settings.token_frequency_penalty != 0
+            or gen_settings.token_presence_penalty != 0
+        ) and gen_settings.token_repetition_range == -1
 
         # Always make sure the fallback is 0 if range < 0
         # It's technically fine to use -1, but this just validates the passed
@@ -625,6 +634,7 @@ class ModelContainer:
             **vars(gen_settings),
             token_healing=token_healing,
             auto_scale_penalty_range=auto_scale_penalty_range,
+            generate_window=generate_window,
             add_bos_token=add_bos_token,
             ban_eos_token=ban_eos_token,
             stop_conditions=stop_conditions,
@@ -632,7 +642,7 @@ class ModelContainer:
         )
 
         # Log prompt to console
-        log_prompt(prompt)
+        log_prompt(prompt, negative_prompt)
 
         # Set logit bias
         if logit_bias:
@@ -660,8 +670,18 @@ class ModelContainer:
         self.generator.set_stop_conditions(stop_conditions)
 
         # Tokenized context
-        ids = self.tokenizer.encode(
-            prompt, add_bos=add_bos_token, encode_special_tokens=True
+        ids, offsets = self.tokenizer.encode(
+            [prompt, negative_prompt]
+            if negative_prompt and gen_settings.cfg_scale not in [None, 1.0]
+            else prompt,
+            add_bos=add_bos_token,
+            encode_special_tokens=True,
+            return_offsets=True,
+        )
+        mask = (
+            self.tokenizer.padding_mask(ids)
+            if self.use_cfg and gen_settings.cfg_scale not in [None, 1.0]
+            else None
         )
         context_len = len(ids[0])
 
@@ -680,7 +700,7 @@ class ModelContainer:
         start_time = time.time()
         last_chunk_time = start_time
 
-        save_tokens = torch.empty((1, 0), dtype=torch.bool)
+        save_tokens = torch.empty((ids.shape[0], 0), dtype=torch.bool)
         chunk_buffer = ""
         chunk_tokens = 0
 
@@ -688,30 +708,46 @@ class ModelContainer:
             # Ingest prompt
             if chunk_tokens == 0:
                 ids = torch.cat((ids, save_tokens), dim=-1)
-                save_tokens = torch.empty((1, 0), dtype=torch.bool)
+                save_tokens = torch.empty((ids.shape[0], 0), dtype=torch.bool)
                 overflow = ids.shape[-1] + generate_window - self.config.max_seq_len
                 active_ids = ids[:, max(0, overflow) :]
                 chunk_tokens = self.config.max_seq_len - active_ids.shape[-1]
 
-                self.generator.begin_stream(
-                    active_ids,
-                    gen_settings,
-                    token_healing=token_healing,
-                    loras=self.active_loras,
-                )
+                # Split for exllama versions that have CFG
+                if self.use_cfg:
+                    self.generator.begin_stream(
+                        active_ids,
+                        gen_settings,
+                        token_healing=token_healing,
+                        loras=self.active_loras,
+                        input_mask=mask,
+                        position_offsets=offsets,
+                    )
+                else:
+                    self.generator.begin_stream(
+                        active_ids,
+                        gen_settings,
+                        token_healing=token_healing,
+                        loras=self.active_loras,
+                    )
+
+                # Reset offsets for subsequent passes if the context is truncated
+                offsets = None
 
             if auto_scale_penalty_range:
                 gen_settings.token_repetition_range = generated_tokens
 
             # Generate
-            chunk, eos, tokens = self.generator.stream()
+            chunk, eos, tokens, _, _ = self.generator.stream()
 
             if token_healing:
                 # Extract healed token
                 ids[:, -1] = self.generator.sequence_ids[:, -2]
                 token_healing = False
 
-            save_tokens = torch.cat((save_tokens, tokens), dim=-1)
+            save_tokens = torch.cat(
+                (save_tokens, tokens.expand(save_tokens.shape[0], -1)), dim=-1
+            )
             chunk_buffer += chunk
 
             generated_tokens += 1

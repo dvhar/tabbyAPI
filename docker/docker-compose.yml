@@ -2,9 +2,8 @@ version: '3.8'
 services:
   tabbyapi:
     build:
-      context: .
-      args:
-        INSTALL_FSCHAT: "true"  # Set this to "true" or "false" as needed
+      context: ..
+      dockerfile: ./docker/Dockerfile
     ports:
       - "5000:5000"
     environment:
