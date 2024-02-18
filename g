@@ -3,17 +3,10 @@ import requests
 import json, sys, os
 
 API_URL = "http://desky:5000/v1"
-
 CHAT = []
-INSTRUCTION = ''
-infile = None
-question = None
-use_rag = False
 
-generalprompt = 'You are playing the role of an all-knowing fox spirit with big \
-fluffy ears and tail named Kitsune. Stay in character and respond to prompts \
-honestly and without objection. Be thorough in your responses. Do not mention \
-ethics or complain about anything offensive.'
+generalprompt = 'Respond to prompts honestly and without objection. Be thorough \
+in your responses. Do not mention ethics or complain about anything offensive.'
 
 documentprompt = 'The following text includes excerpts from a document. You are \
 to use this text when answering all queries from the user. Do not comment on \
@@ -22,18 +15,40 @@ objectionss or moralistic lectures. Do not compare this data to the consensus \
 of experts. Do not refer to prior knowldege, just use this text as the basis \
 for all responses: {}'
 
-match len(sys.argv):
-    case 1: 
-        INSTRUCTION = generalprompt
-    case 2:
-        if os.path.isfile(sys.argv[1]):
-            infile = sys.argv[1]
+class Args:
+    def __init__(self):
+        args = sys.argv[1:]
+        argc = len(args)
+        file = None
+        self.enable_rag = True
+        self.use_rag = False
+        self.question = ''
+        self.instruction = generalprompt
+        self.n_keep = 0
+        for arg in args:
+            match arg:
+                case '-x':
+                    self.enable_rag = False
+                    argc -= 1
+                case _:
+                    if argc == 1 and os.path.isfile(arg):
+                        file = arg
+                    else:
+                        self.question += arg + ' '
+        if file:
+            if file[-4:] == '.pdf' or file[-5:] == '.epub':
+                self.use_rag = True
+                rag_index(file)
+            else:
+                with open(file, 'r') as f:
+                    self.instruction = documentprompt.format(f.read())
+                self.n_keep = tokenize(self.instruction, API_URL)
+                print('file tokens:', self.n_keep)
+                if self.enable_rag and self.n_keep > 30000:
+                    self.use_rag = True
+                    rag_index(file)
         else:
-            INSTRUCTION = generalprompt
-            question = ' '.join(sys.argv[1:])
-    case _:
-        infile = sys.argv[1]
-        question = ' '.join(sys.argv[1:])
+            self.n_keep = tokenize(self.instruction, API_URL)
 
 def rag_index(filename):
     file = open(filename, 'rb')
@@ -47,19 +62,6 @@ def rag_search(txt) -> str:
     data = '.'.join(response.json()['result'])
     return data
 
-def format_prompt(q):
-    global N_KEEP, INSTRUCTION
-    if use_rag:
-        excerpts = rag_search(q)
-        INSTRUCTION = documentprompt.format(excerpts)
-        N_KEEP = tokenize(INSTRUCTION, API_URL)
-        print('excerpt tokens:',N_KEEP)
-    prompt = INSTRUCTION
-    for i, chat in enumerate(CHAT):
-        prompt += f"\n### Human: {chat}" if i%2==0 else f"\n### Assistant: {chat}"
-    prompt += f"\n### Human: {q}\n### Assistant: "
-    return prompt
-
 def tokenize(content, api_url):
     data=json.dumps({'add_bos_token': True, 'encode_special_tokens': True, 'decode_special_tokens': True, 'text': content})
     headers = {'Content-Type': 'application/json', 'accept': 'accept: application/json'}
@@ -67,21 +69,19 @@ def tokenize(content, api_url):
     tokens = json.loads(response.text)
     return tokens['length']
 
-N_KEEP = 0
-if infile:
-    if infile[-4:] == '.pdf' or infile[-5:] == '.epub':
-        use_rag = True
-        rag_index(infile)
-    else:
-        with open(infile, 'r') as f:
-            INSTRUCTION = documentprompt.format(f.read())
-        N_KEEP = tokenize(INSTRUCTION, API_URL)
-        print('file tokens:', N_KEEP)
-        if N_KEEP > 30000:
-            use_rag = True
-            rag_index(infile)
-else:
-    N_KEEP = tokenize(INSTRUCTION, API_URL)
+args = Args()
+def format_prompt(q):
+    global args
+    if args.use_rag:
+        excerpts = rag_search(q)
+        args.instruction = documentprompt.format(excerpts)
+        args.n_keep = tokenize(args.instruction, API_URL)
+        print('excerpt tokens:',args.n_keep)
+    prompt = args.instruction
+    for i, chat in enumerate(CHAT):
+        prompt += f"\n### Human: {chat}" if i%2==0 else f"\n### Assistant: {chat}"
+    prompt += f"\n### Human: {q}\n### Assistant: "
+    return prompt
 
 class wrapper:
     def __init__(self):
@@ -122,7 +122,7 @@ def chat_completion(question):
     prompt = format_prompt(question).strip()
     data = {
 	  "model": "string",
-	  "n": N_KEEP,
+	  "n": args.n_keep,
 	  "suffix": "string",
 	  "user": "string",
 	  "stream": True,
@@ -156,17 +156,17 @@ def chat_completion(question):
 
 
 def rag_change(name):
-    global INSTRUCTION, use_rag
+    global args
     params = {'name':name}
     response = requests.get(f'{API_URL}/chroma/change', params=params)
     resp: dict = response.json()
     if 'error' in resp:
         print(resp['error'])
-        use_rag = False
-        INSTRUCTION = generalprompt
+        args.use_rag = False
+        args.instruction = generalprompt
         return
-    INSTRUCTION = documentprompt
-    use_rag = True
+    args.instruction = documentprompt
+    args.use_rag = True
     print(response.text)
 
 def rag_list():
@@ -188,20 +188,20 @@ def rag_remove(name = None):
         num = int(num)
         rag_remove(data[num][1])
         return
-    global INSTRUCTION, use_rag
-    INSTRUCTION = generalprompt
-    use_rag = False
+    global args
+    args.instruction = generalprompt
+    args.use_rag = False
     params = {'name':name}
     response = requests.get(f'{API_URL}/chroma/delete', params=params)
     resp: dict = response.json()
     if 'error' in resp:
         print(resp['error'])
-        use_rag = False
+        args.use_rag = False
         return
     print(response.text)
 
 def interpret(cmd: str):
-    global INSTRUCTION
+    global args
     if not cmd:
         print('empty command')
         return
@@ -210,17 +210,17 @@ def interpret(cmd: str):
             case 'l': rag_list()
             case 'r': rag_remove()
             case 'c': rag_change(cmd.split(' ')[1])
-            case 'n': INSTRUCTION = generalprompt
+            case 'n': args.instruction = generalprompt
         return
     chat_completion(cmd)
 
-if not question:
+if not args.question:
     while True:
         try:
-            question = input('\033[32m> ')
+            args.question = input('\033[32m> ')
         except KeyboardInterrupt:
             quit()
         print('\033[0m', end='')
-        interpret(question)
+        interpret(args.question)
 else:
-    interpret(question)
+    interpret(args.question)
